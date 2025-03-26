@@ -104,7 +104,4 @@ This tool helps cyber threat intelligence teams monitor public Telegram sources 
 
 ---
 
-## 👤 Author
-**Vasily Kononov**  
-Threat Intelligence Lead  
 
