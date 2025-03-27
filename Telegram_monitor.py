@@ -6,15 +6,30 @@ import logging
 import traceback
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events
+from telethon.errors import UsernameInvalidError, FloodWaitError
 
-# --- START OF FILE Telegram_monitor.py ---
+# Path settings
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_FILE = os.path.join(BASE_DIR, 'credentials.json')
+KEYWORDS_FILE = os.path.join(BASE_DIR, 'keywords.txt')
+CHANNELS_FILE = os.path.join(BASE_DIR, 'channels.txt')
+SESSION_NAME = os.path.join(BASE_DIR, 'user_session')
+SENT_FILE = os.path.join(BASE_DIR, 'sent_messages.txt')
+MAX_SENT_MESSAGES = 10000
 
-# Load configuration from credentials.json
-CREDENTIALS_FILE = '/root/Telegram_monitor/credentials.json'
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(BASE_DIR, "bot.log")),
+        logging.StreamHandler()
+    ]
+)
 
+# Load credentials
 if not os.path.exists(CREDENTIALS_FILE):
-    # File {CREDENTIALS_FILE} not found! Specify API ID, HASH, and TOKEN.
-    raise FileNotFoundError(f"File {CREDENTIALS_FILE} not found! Specify API ID, HASH, and TOKEN.")
+    raise FileNotFoundError(f"File {CREDENTIALS_FILE} not found!")
 
 with open(CREDENTIALS_FILE, 'r', encoding='utf-8') as file:
     credentials = json.load(file)
@@ -22,156 +37,167 @@ with open(CREDENTIALS_FILE, 'r', encoding='utf-8') as file:
 TELEGRAM_API_ID = int(credentials["api_id"])
 TELEGRAM_API_HASH = credentials["api_hash"]
 TELEGRAM_PHONE = credentials["phone"]
-BOT_TOKEN = credentials["bot_token"]
 PRIVATE_CHANNEL_LINK = credentials.get("channel_id", None)
 
-# Configuration files
-KEYWORDS_FILE = 'keywords.txt'
-CHANNELS_FILE = 'channels.txt'
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
-)
-
+# File operations
 def load_entries_from_file(file_path):
-    """Loads lines from a file, removing empty ones"""
     if not os.path.exists(file_path):
         logging.error(f"File {file_path} not found.")
         return []
     with open(file_path, 'r', encoding='utf-8') as file:
-        entries = [x.strip() for x in file.read().splitlines() if x.strip()]
-    return entries
+        return [x.strip() for x in file.read().splitlines() if x.strip()]
 
 def load_patterns():
-    """Creates regex patterns for keywords"""
     keywords = load_entries_from_file(KEYWORDS_FILE)
     word_patterns = {}
-
     for word in keywords:
-        # Using \b for word boundaries and (?i) for case-insensitivity
         pattern = rf'\b(?i){regex.escape(word)}\b'
         try:
-            compiled = regex.compile(pattern)
-            word_patterns[word] = compiled
+            word_patterns[word] = regex.compile(pattern)
         except regex.error as e:
             logging.error(f'Regex error for "{word}": {e}')
     return word_patterns
 
+def load_sent():
+    if not os.path.exists(SENT_FILE):
+        return set()
+    with open(SENT_FILE, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f if line.strip()]
+        if len(lines) > MAX_SENT_MESSAGES:
+            logging.warning(f"📦 sent_messages.txt exceeds {MAX_SENT_MESSAGES} lines, clearing...")
+            os.remove(SENT_FILE)
+            return set()
+        return set(lines)
+
+def save_sent(sent_ids):
+    if len(sent_ids) > MAX_SENT_MESSAGES:
+        logging.warning(f"📦 Sent message count exceeded {MAX_SENT_MESSAGES}, clearing...")
+        sent_ids.clear()
+        if os.path.exists(SENT_FILE):
+            os.remove(SENT_FILE)
+    else:
+        with open(SENT_FILE, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(sent_ids))
+
+# Safe message sending with FloodWait handling
+async def safe_send_message(client, target, text):
+    try:
+        await client.send_message(target, text, link_preview=False)
+    except FloodWaitError as e:
+        logging.warning(f"⏳ FloodWait: sleeping for {e.seconds} seconds...")
+        await asyncio.sleep(e.seconds)
+        await client.send_message(target, text, link_preview=False)
+    except Exception as e:
+        logging.error(f"❌ Error while sending message: {e}")
+        logging.error(traceback.format_exc())
+
+# Processing recent messages
 async def check_recent_messages(client, private_channel, channels, word_patterns):
-    """Checks messages from the last 12 hours"""
     twelve_hours_ago = datetime.now(timezone.utc) - timedelta(hours=12)
+    sent = load_sent()
 
     for channel in channels:
         try:
             entity = await client.get_entity(channel)
-            # Fetch a reasonable number of recent messages (e.g., 100)
             messages = await client.get_messages(entity, limit=100)
 
             for message in messages:
-                # Skip messages older than 12 hours
                 if message.date.replace(tzinfo=timezone.utc) < twelve_hours_ago:
-                    continue # Optimization: if we hit an old message, likely the rest are too
+                    continue
+
+                msg_key = f"{entity.id}:{message.id}"
+                if msg_key in sent:
+                    continue
 
                 message_content = message.message or ""
                 word_counts = {}
 
-                # Check each keyword pattern against the message content
                 for word, pattern in word_patterns.items():
                     matches = list(pattern.finditer(message_content))
                     if matches:
                         word_counts[word] = len(matches)
 
-                # If any keywords were found, format and send the notification
                 if word_counts:
-                    # Format matched words, showing count if > 1
-                    matched_words_str = ', '.join(f"{word} ({count})" if count > 1 else word for word, count in word_counts.items())
-
-                    message_text = (
-                        # Found keywords in {entity.title}: {matched_words_str}
-                        f"🔎 Found keywords in {entity.title}: {matched_words_str}\n"
-                        # Message:
-                        f"📝 Message:\n{message_content[:1000]}..." # Truncate long messages
+                    matched_words_str = ', '.join(
+                        f"{word} ({count})" if count > 1 else word
+                        for word, count in word_counts.items()
                     )
-                    await client.send_message(private_channel, message_text, link_preview=False)
-                    # Sent message from {entity.title}
-                    logging.info(f"Sent message from {entity.title}")
+                    msg_text = (
+                        f"🔎 Keywords found in {entity.title}: {matched_words_str}\n"
+                        f"📝 Message:\n{message_content[:1000]}..."
+                    )
+                    await safe_send_message(client, private_channel, msg_text)
+                    logging.info(f"Message sent from {entity.title}")
+                    sent.add(msg_key)
+                    save_sent(sent)
+                    await asyncio.sleep(1)
 
+        except UsernameInvalidError:
+            logging.warning(f"⚠️ Invalid or non-existent channel: {channel}")
         except Exception as e:
-            # Error processing recent messages from {channel}: {e}
-            logging.error(f"Error processing recent messages from {channel}: {e}")
+            logging.error(f"Error while processing channel {channel}: {e}")
+            logging.error(traceback.format_exc())
 
+# Main logic
 async def main():
     try:
-        client = TelegramClient('user_session', TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        client = TelegramClient(SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
         await client.start(phone=TELEGRAM_PHONE)
-        # Client started successfully.
         logging.info("Client started successfully.")
 
         if not PRIVATE_CHANNEL_LINK:
-            # Error: channel_id is missing in credentials.json!
             raise ValueError("Error: channel_id is missing in credentials.json!")
 
         private_channel = await client.get_entity(PRIVATE_CHANNEL_LINK)
-        # Fetched private channel: {private_channel.title} (ID: {private_channel.id})
-        logging.info(f"Fetched private channel: {private_channel.title} (ID: {private_channel.id})")
+        logging.info(f"Private channel obtained: {private_channel.title} (ID: {private_channel.id})")
 
         word_patterns = load_patterns()
         channels = load_entries_from_file(CHANNELS_FILE)
 
-        # Send a startup message to the private channel
-        await client.send_message(private_channel, f"📡 Bot started. Monitoring channels: {', '.join(channels)}")
-        # Sent startup message to the private channel.
-        logging.info("Sent startup message to the private channel.")
+        await safe_send_message(client, private_channel, f"📡 Bot started. Monitoring channels: {', '.join(channels)}")
+        logging.info("Startup message sent to private channel.")
 
-        # Check recent messages upon startup
         await check_recent_messages(client, private_channel, channels, word_patterns)
 
-        # Define the event handler for new messages in the monitored channels
+        sent = load_sent()
+
         @client.on(events.NewMessage(chats=channels))
         async def handler(event):
             try:
                 message_content = event.message.message or ""
                 word_counts = {}
 
-                # Check each keyword pattern against the new message content
                 for word, pattern in word_patterns.items():
                     matches = list(pattern.finditer(message_content))
                     if matches:
                         word_counts[word] = len(matches)
 
-                # If any keywords were found, format and send the notification
                 if word_counts:
-                    # Format matched words, showing count if > 1
-                    matched_words_str = ', '.join(f"{word} ({count})" if count > 1 else word for word, count in word_counts.items())
-
-                    message_text = (
-                        # Match found in {event.chat.title}: {matched_words_str}
-                        f"📢 Match found in {event.chat.title}: {matched_words_str}\n"
-                        # Message:
-                        f"📝 Message:\n{message_content[:1000]}..." # Truncate long messages
+                    msg_key = f"{event.chat_id}:{event.message.id}"
+                    if msg_key in sent:
+                        return
+                    matched_words_str = ', '.join(
+                        f"{word} ({count})" if count > 1 else word
+                        for word, count in word_counts.items()
                     )
-                    await client.send_message(private_channel, message_text, link_preview=False)
-                    # Sent message from {event.chat.title}
-                    logging.info(f"Sent message from {event.chat.title}")
+                    msg_text = (
+                        f"📢 Match found in {event.chat.title}: {matched_words_str}\n"
+                        f"📝 Message:\n{message_content[:1000]}..."
+                    )
+                    await safe_send_message(client, private_channel, msg_text)
+                    logging.info(f"Message sent from {event.chat.title}")
+                    sent.add(msg_key)
+                    save_sent(sent)
 
             except Exception as e:
-                # Error processing message: {e}
-                logging.error(f"Error processing message: {e}")
-                logging.error(traceback.format_exc()) # Log full traceback for debugging
+                logging.error(f"Error while processing incoming message: {e}")
+                logging.error(traceback.format_exc())
 
-        # Keep the client running until disconnected
         await client.run_until_disconnected()
 
     except Exception as e:
-        # Error in main: {e}
         logging.error(f"Error in main: {e}")
-        logging.error(traceback.format_exc()) # Log full traceback for debugging
+        logging.error(traceback.format_exc())
 
 if __name__ == '__main__':
     asyncio.run(main())
-# --- END OF FILE Telegram_monitor.py ---
